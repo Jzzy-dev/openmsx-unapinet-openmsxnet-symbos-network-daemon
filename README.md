@@ -7,12 +7,13 @@ A network daemon for Symbos booting on OpenMSX with Unapinet / OpenMSXnet
 
 <a href="https://msx.pics/image/xtYXZ"><img src="https://msx.pics/images/2026/10/14/openmsx_zktvYtE5rj.md.png" alt="openmsx zktvYtE5rj" border="0"></a>
 
+<a href="https://msx.pics/image/x4PAI"><img src="https://msx.pics/images/2026/10/18/explorer_rEefNElqDx.md.png" alt="explorer rEefNElqDx" border="0"></a>
 
 # SymbOS Network Daemon driver for the openMSXnet UNAPI bridge
 
-Status, assembled and tested in a Z80 emulator against a model of the openMSXnet bridge (31 checks,
-DNS, TCP client and server, UDP, link loss). Not yet run under SymbOS in openMSX. Driver version 0.1,
-shown in the Driver tab as openMSXnet v0.1.
+Status, v0.1 working under SymbOS in openMSX. Driver version 0.2 adds HTTPS, shown in the Driver tab as
+openMSXnet v0.2. HTTPS needs an openMSX built with the TLS patch for openMSXnet (bridge version 5),
+with an older openMSXnet build the driver works as before without TLS.
 
 ## Build
 Same as the PicoVerse build, only the wrapper and the hardware file change.
@@ -23,6 +24,12 @@ Wrapper order, constants file, Dmn-Network-head.asm, Dmn-Network-libs.asm, Dmn-N
 |---|---|
 | Dmn-Network-_ONX.asm | wrapper, DRIVER 6, writes netd-onx.exe |
 | Dmn-Network-ONX.asm | hardware layer for openMSXnet, replaces Dmn-Network-ESP.asm |
+
+Switches in the wrapper, as for the PicoVerse build plus
+
+| Switch | Meaning |
+|---|---|
+| TLSVERIFY equ 1 | 1 (default) = the server certificate is checked, 0 = encrypt only |
 
 Both drivers can live in the same folder, each wrapper reads its own hardware file.
 
@@ -55,8 +62,24 @@ The bridge queues up to 16 datagrams per handle and UDP_RECV returns an empty he
 waiting, so the PicoVerse workaround (never UDP_STATE, poll every 2nd time) is not needed. The driver
 asks UDP_RECV on every poll. Largest datagram 576 bytes, longer ones are cut by the bridge.
 
+## HTTPS / TLS
+Same rules as the PicoVerse driver, the TLS work is done by openMSX on the host (mbedTLS).
+* A client connection to port 443, 8443, 465, 993 or 995 becomes a TLS connection (onx_tlsports),
+  the program talks plain data. Server connections stay plain.
+* The host name for SNI and the certificate check comes from the last four DNS answers (name and IP).
+* TLSVERIFY 1 is the default here, unlike the PicoVerse build. The certificate is checked against
+  the root certificates of the host computer (Windows certificate store, the system bundle on Linux
+  and macOS), so nothing has to be installed. A connection by IP number without a previous name
+  lookup has no host name, then only the certificate chain is checked and not the name (as the
+  UNAPI spec does for a zero host name), and no SNI is sent, which some servers refuse.
+* TLS only when the bridge reports version 5 or newer, the info line of the Driver tab shows
+  "bridge v5, HTTPS" or "bridge v4, no TLS".
+* The handshake shows as "opening", a failed one as a refused connection. openMSX writes the reason
+  (and on success version and cipher) to its console output, start openmsx from a terminal to see it.
+* TLS 1.2 and 1.3, no limit of one TLS connection like the ESP, all four handles can be TLS.
+
 ## Limits from openMSXnet
-* 4 TCP and 4 UDP handles, no TLS, no raw IP, no ICMP in this driver.
+* 4 TCP and 4 UDP handles, no raw IP, no ICMP in this driver.
 * A TCP send waits inside the emulator until the host accepts the data (max 2 seconds), the
   emulated MSX stands still that long.
 * Save states do not keep connections.
