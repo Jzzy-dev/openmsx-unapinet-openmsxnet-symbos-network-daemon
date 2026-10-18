@@ -29,6 +29,14 @@
 ;   The bridge only knows the local IP of the host. Mask 255.255.255.0, gateway x.y.z.1
 ;   and DNS 8.8.8.8 / 8.8.4.4 are filled in the same way UNAPINET.COM does it. DNS
 ;   names are resolved by the host (getaddrinfo), so these values are only shown.
+;
+; HTTPS / TLS (bridge version 5 or newer)
+;   The bridge does TLS on the host with mbedTLS. Like the PicoVerse driver the
+;   SymbOS network API has no TLS flag, so a client connection to one of the ports
+;   in onx_tlsports becomes a TLS connection, the program talks plain data. The
+;   host name for SNI and the certificate check comes from the last four DNS
+;   answers. TLSVERIFY in the wrapper, 1 = check the certificate against the root
+;   certificates of the host computer, 0 = encrypt only.
 
 onx_cmd         equ #28         ;write command, read status
 onx_dat         equ #29         ;write parameter, read result
@@ -49,6 +57,12 @@ onx_c_udpsend   equ #0c
 onx_c_localip   equ #0d
 onx_c_udprecv   equ #0f
 onx_c_querycap  equ #10
+
+if TLSVERIFY=1
+onx_tlsflg      equ 12          ;TLS and check the certificate
+else
+onx_tlsflg      equ 4           ;TLS, the certificate is not checked
+endif
 
 onx_blen        equ 512         ;TCP bounce buffer (the bridge takes up to 4096 per call)
 esp_udpmax      equ 576         ;largest datagram payload handled
@@ -72,6 +86,7 @@ esp_uconn       ds low_sockmax  ;bridge UDP handle per daemon socket, 0 = none
 onx_dnsst       db 0            ;0 idle, 1 pending, 2 ok, 3 failed
 esp_dnsres      ds 4            ;last DNS result
 onx_chkcnt      db 250          ;link check divider
+onx_bver        db 0            ;bridge version from QUERY_CAP, TLS needs 5 or newer
 
 onx_st          ds 12           ;TCP_STATE answer, state, avail(2), reason,
                                 ;remote IP(4), remote port(2), local port(2)
@@ -184,6 +199,9 @@ onxtxfr db "openMSXnet v"
         db 0                                        ;max 18 characters
 onxtxin db "Host network, bridge v"
 onxtxiv db "?",0
+onxtxtl db ", HTTPS",0
+onxtxnt db ", no TLS",0
+onx_inft ds 40
 onxtxno db "Bridge not answering",0
 
 ;### LOWINI -> hardware init / configuration
@@ -196,6 +214,12 @@ lowini  or a
         ret
 lowini0 xor a
         ld (onx_dnsst),a
+        ld (onx_bver),a
+        ld hl,onx_hni           ;forget the host names
+        ld de,onx_hni+1
+        ld bc,4*68
+        ld (hl),a
+        ldir
         ld hl,esp_conn
         ld de,esp_conn+1
         ld bc,low_sockmax*2-1   ;esp_conn and esp_uconn
@@ -227,13 +251,24 @@ lowini1 ld hl,onxtxad
         jr nz,lowini2
         in a,(onx_dat)
         in a,(onx_dat)
+        ld (onx_bver),a
         and 15
         add 48
         cp 58
         jr c,lowini3
         add 7
 lowini3 ld (onxtxiv),a
-lowini2 ld hl,onxtxin
+lowini2 ld hl,onxtxin           ;"Host network, bridge vX" and the TLS state
+        ld de,onx_inft
+        call onxtxt
+        dec de
+        ld hl,onxtxtl
+        ld a,(onx_bver)
+        cp 5
+        jr nc,lowini4
+        ld hl,onxtxnt
+lowini4 call onxtxt
+        ld hl,onx_inft
         call onxinf
         or a
         ret
@@ -302,6 +337,14 @@ esppol  ld a,(onx_dnsst)
 ;### Output     CF=0 ok, CF=1 A=error
 ;### Destroyed  AF,BC,DE,HL,IX,IY
 lowtop  ld c,a                  ;C=socket
+        push bc
+        ld a,e
+        and 1
+        ld (onx_mode),a         ;bit 0 = passive (server)
+        call onxtls             ;TLS port? A=flag bits, HL=host name
+        ld (onx_tlsf),a
+        ld (onx_tlsp),hl
+        pop bc
         ld a,(ix+2):out (onx_dat),a     ;remote IP, network order
         ld a,(ix+3):out (onx_dat),a
         ld a,(ix+4):out (onx_dat),a
@@ -313,10 +356,20 @@ lowtop  ld c,a                  ;C=socket
         xor a
         out (onx_dat),a                 ;timeout, not used by the bridge
         out (onx_dat),a
-        ld a,e
-        and 1                           ;flags bit 0 = passive
+        ld a,(onx_mode)                 ;flags bit 0 = passive, bit 2 = TLS, bit 3 = check the certificate
+        ld hl,onx_tlsf
+        or (hl)
         out (onx_dat),a
-        ld a,onx_c_tcpopen
+        ld a,(hl)
+        or a
+        jr z,lowtop2
+        ld hl,(onx_tlsp)                ;host name and its terminator follow for TLS
+lowtop1 ld a,(hl)
+        out (onx_dat),a
+        inc hl
+        or a
+        jr nz,lowtop1
+lowtop2 ld a,onx_c_tcpopen
         call onxcmd
         jr nz,lowtop9
         in a,(onx_dat)                  ;handle 1-4, 0 = failed
@@ -330,6 +383,72 @@ lowtop  ld c,a                  ;C=socket
         ret
 lowtop9 ld a,neterrcon
         scf
+        ret
+
+;### ONXTLS -> decide if this open is TLS
+;### Input      (onx_mode)=mode (bit 0 = server), IX=parameter block
+;### Output     A=flag bits for the bridge (0 = plain TCP), HL=host name (0 terminated)
+;### Destroyed  F,BC,DE,IY
+onx_mode        db 0
+onx_tlsf        db 0
+onx_tlsp        dw 0
+onx_nohost      db 0
+onx_tlsports    dw 443,8443,465,993,995,0
+
+onxtls  ld hl,onx_nohost
+        ld a,(onx_mode)
+        or a
+        ld a,0
+        ret nz                  ;server connections stay plain
+        ld a,(onx_bver)
+        cp 5
+        ld a,0
+        ret c                   ;the bridge has no TLS
+        ld c,(ix+6)
+        ld b,(ix+7)             ;BC=remote port
+        ld hl,onx_tlsports
+onxtl0  ld e,(hl)
+        inc hl
+        ld d,(hl)
+        inc hl
+        ld a,d
+        or e
+        jr z,onxtl9             ;not a TLS port
+        ld a,e
+        cp c
+        jr nz,onxtl0
+        ld a,d
+        cp b
+        jr nz,onxtl0
+        call onxhnf             ;HL=host name of this IP, or the empty one
+        ld a,onx_tlsflg
+        ret
+onxtl9  ld hl,onx_nohost
+        xor a
+        ret
+
+;### ONXHNF -> find the cache entry of the IP at (IX+2..5)
+;### Output     ZF=1 found, IY=entry, HL=its name ; ZF=0 not found, HL=empty name
+;### Destroyed  AF,B,DE
+onxhnf  ld iy,onx_hn
+        ld b,4
+onxhf1  ld a,(iy+4)
+        or a
+        jr z,onxhf3             ;entry not used
+        ld a,(ix+2):cp (iy+0):jr nz,onxhf3
+        ld a,(ix+3):cp (iy+1):jr nz,onxhf3
+        ld a,(ix+4):cp (iy+2):jr nz,onxhf3
+        ld a,(ix+5):cp (iy+3):jr nz,onxhf3
+        push iy
+        pop hl
+        ld de,4
+        add hl,de               ;ZF stays as set by the last compare
+        ret
+onxhf3  ld de,68
+        add iy,de
+        djnz onxhf1
+        ld hl,onx_nohost
+        or 1                    ;ZF=0
         ret
 
 ;### ONXTSQ -> TCP_STATE of one bridge handle into onx_st
@@ -816,15 +935,24 @@ espdns  ld a,(onx_dnsst)
         cp 1
         scf
         ret z                   ;one request at a time
+        ld de,onx_dnsb          ;keep a copy (63 characters) for the TLS host names
+        ld c,63
         ld b,0                  ;at most 255 characters
 espdns1 ld a,(hl)
         out (onx_dat),a
+        ld (de),a
         or a
         jr z,espdns2
         inc hl
-        djnz espdns1
+        ld a,c
+        or a
+        jr z,espdns4
+        inc de
+        dec c
+espdns4 djnz espdns1
         xor a                   ;too long, terminate it
         out (onx_dat),a
+        ld (de),a
 espdns2 ld a,onx_c_dnsq
         call onxcmd
         scf
@@ -852,9 +980,47 @@ onxdnp8 ld a,3
 onxdnip ld hl,esp_dnsres
         ld bc,4*256+onx_dat
         inir
+        call onxhna             ;remember name and IP for TLS
         ld a,2
         ld (onx_dnsst),a
         or a
+        ret
+
+;### ONXHNA -> remember the name and IP of the DNS answer that just arrived,
+;### an entry with the same IP is reused, otherwise the oldest one
+onx_hni         db 0            ;next entry to replace
+onx_hn          ds 4*68         ;4 entries - IP (4) and name (64)
+onx_dnsb        ds 64           ;name of the running DNS request
+
+onxhna  push ix                  ;IX and IY are kept for the callers of ESPDNS
+        push iy
+        call onxhna3
+        pop iy
+        pop ix
+        ret
+onxhna3 ld ix,esp_dnsres-2      ;ONXHNF compares (IX+2..5)
+        call onxhnf
+        jr z,onxhna2            ;IY=entry of the same IP
+        ld iy,onx_hn
+        ld a,(onx_hni)
+        or a
+        jr z,onxhna1
+        ld b,a
+        ld de,68
+onxhna0 add iy,de
+        djnz onxhna0
+onxhna1 ld a,(onx_hni)
+        inc a
+        and 3
+        ld (onx_hni),a
+onxhna2 push iy
+        pop de
+        ld hl,esp_dnsres
+        ld bc,4
+        ldir
+        ld hl,onx_dnsb
+        ld bc,64
+        ldir
         ret
 
 ;### ESPDNR -> DNSRQR equivalent
